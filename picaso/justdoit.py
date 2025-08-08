@@ -52,7 +52,8 @@ else:
     ref_v = json.load(open(os.path.join(__refdata__,'config.json'))).get('version',2.3)
     
     if __version__ != str(ref_v): 
-        warnings.warn(f"Your code version is {__version__} but your reference data version is {ref_v}. For some functionality you may experience Keyword errors. Please download the newest ref version or update your code: https://github.com/natashabatalha/picaso/tree/master/reference")
+        msg = f"Your code version is {__version__} but your reference data version is {ref_v}. For some functionality you may experience Keyword errors. Please download the newest ref version or update your code: https://github.com/natashabatalha/picaso/tree/master/reference"
+        warnings.warn(msg)
 
 
 if not os.path.exists(os.environ.get('PYSYN_CDBS')): 
@@ -213,11 +214,15 @@ def picaso(bundle,opacityclass, dimension = '1d',calculation='reflected',
 
     #Make sure that all molecules are in opacityclass. If not, remove them and add warning
     no_opacities = [i for i in atm.molecules if i not in opacityclass.molecules]
-    atm.add_warnings('No computed opacities for: '+','.join(no_opacities))
+    atm.add_warnings('I found chemistry for these but I do not have computed individual line opacities (not including continuum) for: '+','.join(no_opacities))
     atm.molecules = np.array([ x for x in atm.molecules if x not in no_opacities ])
     
     #opacity assumptions
     exclude_mol = inputs['atmosphere']['exclude_mol']
+    if isinstance(exclude_mol,dict):
+        for imol in exclude_mol.keys(): 
+            if imol not in opacityclass.molecules: 
+                atm.add_warnings(f'Youve requested that I exclude opacity from {imol} but the set of opacities I have is {opacityclass.molecules} so your spectra will look identical.')
 
     get_opacities = opacityclass.get_opacities
 
@@ -898,7 +903,7 @@ def output_xarray(df, picaso_class, add_output={}, savefile=None):
 
                
         if 'stellar_params' in attrs.keys(): attrs['stellar_params'] = json.dumps(attrs['stellar_params'],cls=JsonCustomEncoder)
-        if 'climate_params' in attrs.keys(): attrs['climate_params'] = json.dumps(attrs['climate_params'],cls=JsonCustomEncoder)
+    if 'climate_params' in attrs.keys(): attrs['climate_params'] = json.dumps(attrs['climate_params'],cls=JsonCustomEncoder)
         
         
     #add anything else requested by the user
@@ -979,7 +984,7 @@ def input_xarray(xr_usr, opacity,calculation='planet',approx_kwargs={}):
     
     if 'brown' not in calculation:
         stellar_params = eval(xr_usr.attrs['stellar_params'])
-        orbit_params = eval(xr_usr.attrs['orbit_params'])
+        orbit_params = eval(xr_usr.attrs.get('orbit_params',"""{}"""))
         steff = _finditem(stellar_params,'steff')
         feh = _finditem(stellar_params,'feh')
         logg = _finditem(stellar_params,'logg')
@@ -987,9 +992,15 @@ def input_xarray(xr_usr, opacity,calculation='planet',approx_kwargs={}):
         ms = _finditem(stellar_params,'ms')
         rs = _finditem(stellar_params,'rs')
         semi_major = _finditem(orbit_params,'sma')
+        if isinstance(semi_major,type(None)):
+            semi_major = None
+            semi_major_unit = None
+        else: 
+            semi_major=semi_major['value']
+            semi_major_unit=u.Unit(semi_major['unit'])
         case.star(opacity, steff,feh,logg, radius=rs['value'], 
                   radius_unit=u.Unit(rs['unit']), database=database, 
-                  semi_major=semi_major['value'],semi_major_unit=u.Unit(semi_major['unit']))
+                  semi_major=semi_major,semi_major_unit=semi_major_unit)
 
     mp = _finditem(planet_params,'mp')
     rp = _finditem(planet_params,'rp')
@@ -1242,7 +1253,7 @@ def opannection(wave_range = None, filename_db = None,
                 preload_gases='all',
                 #deq= False, on_fly=False,
                 #gases_fly =None,ck=False,
-                verbose=True):
+                verbose=False):
     """
     Sets up database connection to opacities. 
 
@@ -1300,7 +1311,8 @@ def opannection(wave_range = None, filename_db = None,
         opacityclass=RetrieveOpacities(
                     filename_db, 
                     raman_db,
-                    wave_range = wave_range, resample = resample)   
+                    wave_range = wave_range, resample = resample)  
+        if verbose: print("verbose=True; Molecule set=",opacityclass.molecules) 
     elif ((method == 'resampled') & isinstance(ck_db,str)):
         raise Exception("ck_db was supplied but method is set to resampled. Change kwarg method='preweighted' to use the preweighted ck tables")
     elif method == 'preweighted':
@@ -4996,14 +5008,14 @@ class inputs():
             #lets initiative a separate place to store this 
             self.inputs['atmosphere']['kzz']={}
 
-        if not self_consistent_kzz:
-            kzz = self.inputs['atmosphere']['profile'].get('kz',False)
-            if isinstance(kzz, bool):
-                raise Exception("""self_consistent_kzz=False but no kzz profile was supplised. Please add to self.inputs['atmosphere']['profile'] """)
+            if not self_consistent_kzz:
+                kzz = self.inputs['atmosphere']['profile'].get('kz',False)
+                if isinstance(kzz, bool):
+                    raise Exception("""self_consistent_kzz=False but no kzz profile was supplised. Please add to self.inputs['atmosphere']['profile'] """)
+                else: 
+                    self.inputs['atmosphere']['kzz']['constant_kzz'] = kzz.values
             else: 
-                self.inputs['atmosphere']['kzz']['constant_kzz'] = kzz.values
-        else: 
-                self.inputs['atmosphere']['kzz']['sc_kzz'] = 0 #placeholder
+                    self.inputs['atmosphere']['kzz']['sc_kzz'] = 0 #placeholder
 
 
         #virga inputs 
