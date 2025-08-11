@@ -97,12 +97,14 @@
 			"h2minus":"opacities/h2minus.csv",
 			"raman":"opacities/raman.txt",
 			"ktable_resortrebin":"climate_INPUTS/ck_cx_cont_opacities_661.db",
-			"ktable_by_molecule":"opacities/resortrebin",
-			"preweighted":"opacities/preweighted",
-			"resampled":"opacities/resampled",
-			"resampled-default":"opacities"
+			"ktable_by_molecule":"climate_INPUTS/ktable_by_molecule"
 		}
 
 	},
-	"test_mode":null
+	"test_mode":null,
+	"user_defined_paths": {
+		"picaso_refdata_path": "/path/to/your/picaso/refdata",
+		"sonora_data_path": "/path/to/your/sonora/data",
+		"correlated_k_db_path": "/path/to/your/correlated_k_db"
+	}
 }

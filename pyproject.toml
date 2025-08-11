@@ -26,8 +26,6 @@ dependencies = [
     "scipy",
     "virga-exo==0.5",
     "xarray",
-    "pooch",
-    "tqdm",
     "bibtexparser",
     "netcdf4",
     "h5netcdf",

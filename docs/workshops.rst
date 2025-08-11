@@ -1,21 +1,13 @@
 Tutorials
 =========
 
-Sagan School 2023: Interpretting JWST Transmission Spectra
-----------------------------------------------------------
-
-.. toctree::
-   :maxdepth: 2
-   
-   Tutorial Material </notebooks/workshops/SaganSchool2023/HowToAnalyzeExoplanetSpectra.ipynb>
-
 ESO ATMO 2021
 -------------
 
 .. toctree::
    :maxdepth: 2
    
-   Tutorial Material </notebooks/workshops/ESO2021/ESO_Tutorial.ipynb>
+   Tutorial </notebooks/workshops/ESO2021/ESO_Tutorial.ipynb>
 
 Early Release Workshop 2021
 ---------------------------
@@ -23,10 +15,10 @@ Early Release Workshop 2021
 .. toctree::
    :maxdepth: 2
    
-   Tutorial Material </notebooks/workshops/ERS2021/ThermalEmissionTutorial.ipynb>
+   Tutorial </notebooks/workshops/ERS2021/ThermalEmissionTutorial.ipynb>
 
 Sagan School 2021: Spectroscopy of Young Planets 
-------------------------------------------------
+-------------------------------------------------------
 
 .. toctree::
    :maxdepth: 2

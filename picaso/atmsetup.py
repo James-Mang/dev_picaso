@@ -143,7 +143,7 @@ class ATMSETUP():
                                 if 'lat' not in i:
                                     if 'lon' not in i:
                                         self.add_warnings("Ignoring %s in input file, not recognized molecule" % i)
-                                        
+                                        warnings.warn("Ignoring %s in input file, not a recognized molecule" % i, UserWarning)
                     
                     first = False
                     self.weights = weights 
@@ -208,7 +208,7 @@ class ATMSETUP():
                 else:                   
                     #don't raise exception, instead add user warning that a column has been automatically skipped
                     self.add_warnings("Ignoring %s in input file, not recognized molecule" % i)
-                    
+                    warnings.warn("Ignoring %s in input file, not a recognized molecule" % i, UserWarning)
         
         self.weights = weights 
 
@@ -783,9 +783,6 @@ class ATMSETUP():
         except:
             pass
 
-        if len(self.warnings )>0: 
-            df['warnings'] = self.warnings
-
         return df
 
 def convert_to_simple(iso_name):
@@ -816,7 +813,7 @@ def separate_string_number(string):
     For example, CO2 becomes "C" "O2" in `separate_molecule_name` 
     then this function turns it into [['C'],['O','2']]
     """
-    elements = re.findall(r'[A-Za-z]+|\d+', string)
+    elements = re.findall('[A-Za-z]+|\d+', string)
     return elements
 """
 ## not using this for now.
