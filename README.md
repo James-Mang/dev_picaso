@@ -95,3 +95,13 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
 
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](code_of_conduct.md)
 
+## Integration Testing
+
+This repository includes a script to run all the notebooks as an integration test. This is useful to ensure that all notebooks run without errors after changes have been made to the codebase.
+
+To run the tests, execute the following command from the root of the repository:
+
+```bash
+scripts/test_notebooks.py
+```
+The script will execute all notebooks in the `docs/notebooks` directory and will report any errors.
