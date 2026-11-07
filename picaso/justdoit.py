@@ -4432,7 +4432,7 @@ class inputs():
         mh=1, mmw=2.2, kz_min=1e5, sig=2,
         Teff=None, alpha_pressure=None, supsat=0,
         gas_mmr=None, do_virtual=False, verbose=True,do_holes=False,fhole=None,fthin_cld=None,
-        aggregates=False, Df=None, N_mon=None, r_mon=None, k0=0,latent_heat=False): 
+        aggregates=False, Df=None, N_mon=None, r_mon=None, k0=0,latent_heat=False, condensation_fraction=1.0):
         """
         Runs virga cloud code based on the PT and Kzz profiles 
         that have been added to inptus class.
@@ -4442,6 +4442,11 @@ class inputs():
             Condensates to run in cloud model 
         fsed : float 
             Sedimentation efficiency coefficient
+        condensation_fraction : float, optional
+            Fraction of supersaturated vapor available to condense in Virga.
+            Must be between 0 and 1; default 1 preserves full condensation.
+            This is not the fractional cloud coverage (see fhole). The value
+            is retained for every cloud update during climate iteration.
         b : float
             Denominator of exponential in sedimentation efficiency  (if param is 'exp')
         eps: float
@@ -4501,6 +4506,9 @@ class inputs():
             when spheres grow large enough to become aggregates (this applies only when r_mon is fixed. If N_mon is fixed instead, any value of k0 is fine). 
 
         """
+        if not np.isfinite(condensation_fraction) or not 0 <= condensation_fraction <= 1:
+            raise ValueError("condensation_fraction must be finite and between 0 and 1.")
+
         #stages inputs for cloudy run and also get kwargs for clouds function which we run at the end of this 
         clouds_kwargs=dict(do_holes=do_holes,fhole=fhole,fthin_cld=fthin_cld)
         self.inputs['clouds']['do_holes']=do_holes
@@ -4519,7 +4527,7 @@ class inputs():
         #if this is a climate run lets make sure we have all the right inputs set 
         if 'climate' in self.inputs['calculation']:
             #here are all the virga kwargs 
-            virga_kwargs = dict(patchy_do_holes=do_holes, patchy_fthin_cld=fthin_cld,patchy_fhole=fhole,
+            virga_kwargs = dict(condensation_fraction=condensation_fraction, patchy_do_holes=do_holes, patchy_fthin_cld=fthin_cld,patchy_fhole=fhole,
                             condensates=condensates, directory=directory,
                             fsed=fsed, b=b, eps=eps, param=param, 
                             mh=mh, mmw=mmw, kz_min=kz_min, sig=sig,
@@ -4537,7 +4545,7 @@ class inputs():
         
         #if we are all good for a run, run virga and produce output
         if run:     
-            cloud_p = vj.Atmosphere(condensates, fsed=fsed, b=b, eps=eps, mh=mh, mmw=mmw, sig=sig,
+            cloud_p = vj.Atmosphere(condensates, condensation_fraction=condensation_fraction, fsed=fsed, b=b, eps=eps, mh=mh, mmw=mmw, sig=sig,
                     param=param, verbose=verbose, supsat=supsat, gas_mmr=gas_mmr,
                     aggregates=aggregates, Df=Df, N_mon=N_mon, r_mon=r_mon,k0=k0) 
             if 'kz' not in self.inputs['atmosphere']['profile'].keys():
