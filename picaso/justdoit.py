@@ -3279,7 +3279,9 @@ class inputs():
         nc_p = chem_grid.groupby('temperature').size().values
         pressures = chem_grid['pressure'].unique()
         temps = chem_grid['temperature'].unique()
-        log_abunds = np.log10(chem_grid.drop(['pressure','temperature'],axis=1))
+        # 'index' is bookkeeping in some opacity chemistry tables, not a gas.
+        # Its first value is zero, and log10(0) raises a spurious warning.
+        log_abunds = np.log10(chem_grid.drop(columns=['pressure', 'temperature', 'index'], errors='ignore'))
         species = log_abunds.keys()
 
         #make sure to interp on log and inv array
@@ -5164,7 +5166,12 @@ class inputs():
         return 
     
     def inputs_climate(self, temp_guess= None, pressure= None, rfaci = 1,
-        rcb_guess = None,  rfacv = None, moistgrad = False        ):
+        rcb_guess = None,  rfacv = None, moistgrad = False,
+        jacobian_max_age=1, jacobian_max_drift=0.02, jacobian_broyden=False,
+        cloud_relaxation='legacy', cloud_inexact=False, cloud_inner_maxiter=None,
+        cloud_refresh_thermodynamics=False, cloud_outer_reuse=False,
+        cloud_radiation_cadence=False, cloud_joint=False,
+        jacobian_residual_refresh=False, cloud_joint_scaled=False):
         """
         Get Inputs for Climate run
 
@@ -5187,7 +5194,68 @@ class inputs():
             =1 for dayside
         moistgrad: bool
             Moist adiabatic gradient option
+        jacobian_max_age : int, optional
+            Reuse the frozen-opacity thermal Jacobian for at most this many
+            accepted steps. Default 1 retains rebuilding at every step.
+        jacobian_max_drift : float, optional
+            Refresh after this fractional temperature drift (default 0.02).
+            Reuse never crosses an opacity update or convection-zone change.
+        jacobian_broyden : bool, optional
+            Apply an accepted-step secant update during reuse (default False).
+        cloud_relaxation : str, optional
+            'legacy' retains four-sample averaging. 'adaptive' mixes additive
+            optical moments with bounded adaptive damping and checks raw cloud
+            closure. Experimental; default 'legacy'.
+            'aitken' estimates a bounded relaxation coefficient from successive
+            raw cloud residuals instead of heuristic damping adjustments.
+        cloud_inexact : bool, optional
+            Relax the inner normalized flux target while clouds are changing,
+            then tighten it as raw cloud closure improves. Experimental; False
+            preserves the existing inner stopping rules.
+        cloud_inner_maxiter : int or None, optional
+            With cloud_inexact=True, cap inner iterations while raw clouds are
+            inconsistent. Restore the normal budget once cloud closure passes.
+            Reallocate the profile's existing thermal-iteration budget into
+            more cloud refreshes. None disables this cap; reaching it is not
+            convergence.
+        cloud_refresh_thermodynamics : bool, optional
+            Refresh temperature, lapse rate, mean molecular weight and scale
+            height before updating cloud Kzz after a thermal step. Does not
+            rebuild gas opacity. Experimental; False preserves legacy ordering.
+        cloud_outer_reuse : bool, optional
+            Retain a thermal Jacobian across outer updates within a fixed
+            convection mapping, subject to local opacity and temperature drift.
+        cloud_radiation_cadence : bool, optional
+            Permit up to two skipped thermal solves after a solved state when
+            temperature and local opacity changes are small. Skips cannot
+            satisfy convergence. Opacity and clouds still update.
+        jacobian_residual_refresh : bool, optional
+            Experimental: refresh derivatives on poor residual prediction or
+            stalled reduction. With outer reuse, replaces the opacity-change
+            threshold; temperature, age and failed-step safeguards remain.
+        cloud_joint_scaled : bool, optional
+            With cloud_joint, use fixed tolerance-based scales across steps.
+        cloud_joint : bool, optional
+            Joint block-scaled Aitken relaxation of temperature and cloud
+            optical moments, with convective reconstruction. Experimental.
+            These three outer controls currently require a dry, nonpatchy model.
         """
+        if (isinstance(jacobian_max_age, (bool, np.bool_)) or
+                not isinstance(jacobian_max_age, (int, np.integer)) or jacobian_max_age < 1):
+            raise ValueError('jacobian_max_age must be a positive integer')
+        if not np.isfinite(jacobian_max_drift) or jacobian_max_drift <= 0:
+            raise ValueError('jacobian_max_drift must be finite and positive')
+        if not isinstance(jacobian_broyden, (bool, np.bool_)):
+            raise ValueError('jacobian_broyden must be a boolean')
+        if cloud_relaxation not in ('legacy', 'adaptive', 'aitken'):
+            raise ValueError("cloud_relaxation must be 'legacy', 'adaptive', or 'aitken'")
+        if not isinstance(cloud_inexact, (bool, np.bool_)):
+            raise ValueError('cloud_inexact must be a boolean')
+        if cloud_inner_maxiter is not None and (isinstance(cloud_inner_maxiter, (bool, np.bool_)) or
+                not isinstance(cloud_inner_maxiter, (int, np.integer)) or cloud_inner_maxiter < 1):
+            raise ValueError('cloud_inner_maxiter must be a positive integer or None')
+        if not isinstance(cloud_refresh_thermodynamics, (bool, np.bool_)):
+            raise ValueError('cloud_refresh_thermodynamics must be a boolean')
         if self.inputs['planet']['T_eff'] == 0.0:
             raise Exception('Need to specify Teff with jdi.input for climate run')
         if self.inputs['planet']['gravity'] == 0.0:
@@ -5210,6 +5278,21 @@ class inputs():
         self.inputs['climate']['rfacv'] = rfacv
         self.inputs['climate']['rfaci'] = rfaci
         self.inputs['climate']['moistgrad'] = moistgrad
+        self.inputs['climate']['jacobian_max_age'] = int(jacobian_max_age)
+        self.inputs['climate']['jacobian_max_drift'] = float(jacobian_max_drift)
+        self.inputs['climate']['jacobian_broyden'] = bool(jacobian_broyden)
+        self.inputs['climate']['cloud_relaxation'] = cloud_relaxation
+        self.inputs['climate']['cloud_inexact'] = bool(cloud_inexact)
+        self.inputs['climate']['cloud_inner_maxiter'] = cloud_inner_maxiter
+        self.inputs['climate']['cloud_refresh_thermodynamics'] = bool(cloud_refresh_thermodynamics)
+        for name, value in [('cloud_outer_reuse', cloud_outer_reuse),
+                            ('cloud_radiation_cadence', cloud_radiation_cadence), ('cloud_joint', cloud_joint),
+                            ('jacobian_residual_refresh', jacobian_residual_refresh),
+                            ('cloud_joint_scaled', cloud_joint_scaled)]:
+            if not isinstance(value, (bool, np.bool_)):
+                raise ValueError(name+' must be a boolean')
+            self.inputs['climate'][name] = bool(value)
+
 
         self.add_pt(temp_guess, pressure)
 
@@ -5295,6 +5378,14 @@ class inputs():
         """
         #save to user 
         all_out = {}
+
+        # Reset per-run counters; profile() accumulates them across all inner
+        # solves, including changing convective zones and cloudy iterations.
+        from .climate import CLIMATE_SOLVER_STAT_NAMES
+        self.inputs['climate']['solver_stats'] = np.zeros(len(CLIMATE_SOLVER_STAT_NAMES), dtype=np.int64)
+        self.inputs['climate'].pop('_cloud_solver_state', None)
+        self.inputs['climate'].pop('cloud_diagnostics', None)
+        self.inputs['climate'].pop('outer_solver_stats', None)
         
         #get necessary parameters from opacity ck-tables 
         wno = opacityclass.wno
@@ -5538,6 +5629,8 @@ class inputs():
         flux_net_final = rfacv * flux_net_v_final + rfaci* flux_net_ir_final + tidal
         all_out['fnet/fnetir']=flux_net_final/flux_net_ir_final
         all_out['converged']=final_conv_flag
+        all_out['solver_stats'] = dict(zip(CLIMATE_SOLVER_STAT_NAMES,
+            map(int, self.inputs['climate']['solver_stats'])))
         all_out['flux_balance']=dict(flux_net_ir=flux_net_ir_final, 
                                     flux_net_v = flux_net_v_final,
                                     tidal=tidal,

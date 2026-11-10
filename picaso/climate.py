@@ -16,9 +16,13 @@ from .deq_chem import get_quench_levels
 import os
 
 from collections import namedtuple
+from .cloud_solver import (optical_moments, optical_properties, scaled_cloud_defect,
+                           adaptive_cloud_step, cloud_inner_tolerance, cloud_iteration_limit, optical_change, joint_relaxation, radiation_can_skip)
 
 
 convergence_criteriaT = namedtuple('Conv',['it_max','itmx','conv','convt','x_max_mult'])
+CLIMATE_SOLVER_STAT_NAMES = ('inner_iterations', 'rt_calls', 'jacobian_builds',
+                             'jacobian_reuses', 'backtracks', 'stale_retries', 'broyden_updates')
 
 def update_quench_levels(bundle, Atmosphere, kz, grav,verbose=False): 
     """
@@ -809,7 +813,9 @@ def t_start(nofczns,nstr,convergence_criteria,#
             save_profile, all_profiles, 
             fhole=None, hole_OpacityWEd=None,hole_OpacityNoEd=None, 
             verbose=1, do_holes=None, 
-            moist = False, egp_stepmax = False):
+            moist = False, egp_stepmax = False, jacobian_max_age=1,
+            jacobian_max_drift=0.02, solver_stats=None, jacobian_broyden=False,
+            inner_flux_tolerance=0.0, inner_converged=None, outer_jacobian=None, outer_meta=None, jacobian_residual_refresh=False):
     """
     Module to iterate on the level TP profile to make the Net Flux as close to 0.
     Opacities/chemistry are not updated while iterating in this module.
@@ -868,9 +874,26 @@ def t_start(nofczns,nstr,convergence_criteria,#
         Default=None: will compute fractional cloud coverage 
     moist 
         Defalt= False; computes moist adiabat 
-    egp_stepmax 
-        Default = False; uses the "bug" turned feature where stepmax increases without bounds. Often leads to faster convergence but if you want small T steps this is not 
-        recommended 
+    egp_stepmax
+        True uses a bounded step norm; False retains the legacy growing limit.
+    jacobian_max_age : int
+        Maximum accepted steps per frozen-opacity Jacobian; 1 preserves legacy
+        rebuilding. The cache is local to this call, so opacity and convection
+        changes always invalidate it.
+    jacobian_max_drift : float
+        Maximum fractional temperature drift since a Jacobian was built.
+    solver_stats : ndarray, optional
+        Accumulated counters in CLIMATE_SOLVER_STAT_NAMES order.
+    jacobian_broyden : bool
+        Update the cached Jacobian with an accepted-step secant (default False).
+        This learns only the fixed-opacity response inside this call.
+    inner_flux_tolerance : float
+        Positive values use an actual flux residual normalized by internal flux
+        for stopping. Zero preserves legacy stopping. Used by opt-in inexact
+        cloud coupling; a small temperature step alone cannot satisfy it.
+    inner_converged : ndarray, optional
+        One boolean output flag. False on iteration exhaustion; used to prevent
+        an exhausted inexact solve from satisfying outer convergence.
     verbose : int
         If verbose=0, nothing will print out
         If verbose=1, everything will print out during the run, 
@@ -895,6 +918,25 @@ def t_start(nofczns,nstr,convergence_criteria,#
     tmax = Opagrid.tmax 
     it_max,conv,x_max_mult = convergence_criteria.it_max,convergence_criteria.conv,convergence_criteria.x_max_mult
 
+
+    if jacobian_max_age < 1 or jacobian_max_drift <= 0 or not np.isfinite(jacobian_max_drift):
+        raise ValueError("Invalid Jacobian reuse controls")
+    if inner_flux_tolerance < 0 or not np.isfinite(inner_flux_tolerance):
+        raise ValueError('inner_flux_tolerance must be finite and nonnegative')
+    if inner_converged is None:
+        inner_converged = np.zeros(1, dtype=np.bool_)
+    inner_converged[0] = False
+    if solver_stats is None:
+        solver_stats = np.zeros(7, dtype=np.int64)
+    jacobian_cache = np.zeros((nlevel, nlevel))
+    jacobian_temp = temp.copy()
+    jacobian_age = jacobian_max_age
+    force_jacobian = True
+    if outer_jacobian is not None and outer_meta is not None and outer_meta[0] > 0 and np.all(np.isfinite(outer_jacobian)):
+        jacobian_cache = outer_jacobian.copy()
+        jacobian_temp = outer_meta[2:].copy()
+        jacobian_age = int(outer_meta[1])
+        force_jacobian = False
 
     cldsave_count = 0 # used to track how many cloud profiles to save outside of loop for animation *JM
 
@@ -932,11 +974,13 @@ def t_start(nofczns,nstr,convergence_criteria,#
     #            ubar0,ubar1,cos_theta, F0PI, single_phase,multi_phase,frac_a,frac_b,frac_c,constant_back,constant_forward, 
     #            wno,nwno,ng,nt, gweight,tweight, nlevel, ngauss, gauss_wts,compute_reflected, True)#True for reflected, True for thermal
     if do_holes == True:
+        solver_stats[1] += 1
         flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
                     Disco,Opagrid, F0PI, compute_reflected, compute_thermal, 
                     do_holes=do_holes,fhole=fhole, hole_OpacityWEd=hole_OpacityWEd,hole_OpacityNoEd=hole_OpacityNoEd)
 
     else:                
+        solver_stats[1] += 1
         flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
                     Disco,Opagrid, F0PI, compute_reflected, compute_thermal)
  
@@ -968,6 +1012,7 @@ def t_start(nofczns,nstr,convergence_criteria,#
 
     
     for its in range(it_max):
+        solver_stats[0] += 1
         
         # the total net flux = optical + ir + tidal component
         
@@ -986,6 +1031,7 @@ def t_start(nofczns,nstr,convergence_criteria,#
 
         
         temp_old= temp.copy() 
+        flux_plus_ir_old = flux_plus_ir.copy()
         flux_net_old = flux_net_ir.copy() #fnetip
         flux_net_midpt_old= flux_net_ir_layer.copy()  #fmip
 
@@ -1055,7 +1101,10 @@ def t_start(nofczns,nstr,convergence_criteria,#
         f = 0.5*sum # used in linesearch, defined in NR function fmin
 
         # test if we are already at a root
-        if (test/abs(tidal[0])) < 0.01*tolf :
+        root_tolerance = inner_flux_tolerance if inner_flux_tolerance > 0 else 0.01*tolf
+        if ((test/max(abs(tidal[0]), 1e-30)) < root_tolerance and
+                (inner_flux_tolerance == 0 or np.all(np.isfinite(f_vec[:n_total])))):
+            inner_converged[0] = True
             if verbose: print(" We are already at a root, tolf , test = ",0.01*tolf,", ",test/abs(tidal[0]))
             flag_converge = 2
             dtdp=np.zeros(shape=(nlevel-1))
@@ -1081,174 +1130,196 @@ def t_start(nofczns,nstr,convergence_criteria,#
             iteration_factor = max(0.01, (it_max - its) / it_max)
             step_max *= max(sqrt(sum_1),n_total*1.0)*iteration_factor #step_max_tolerance*
         #if verbose: print('maximum scaled step size',step_max, n_total, sum_1, its)
-        no =n_top_r
-        
-        i_count= 1 #icount
-        
-        flag_no = 0
-        if no < 0 :
-            no_temporary = no
-            no = 0 # to avoid negative of negative index leading to wrong indexing, fort vs. py
-            flag_no = 1 # so that it can be reversed back to previous value after loop
-       
-        for nz in range(0, 3*nofczns, 3):
+        drift = np.max(np.abs(temp_old-jacobian_temp) / np.maximum(np.abs(jacobian_temp), 1.0))
+        rebuild_jacobian = force_jacobian or jacobian_age >= jacobian_max_age or drift > jacobian_max_drift
+        reused_jacobian = not rebuild_jacobian
+        retry_jacobian = False
+        if rebuild_jacobian:
+            solver_stats[2] += 1
+            jacobian_temp = temp_old.copy()
+            no =n_top_r
 
-            n_top = nstr[nz] +1 #ntop
-            n_strt = nstr[nz+1] #nstrt
-            n_conv_top = n_strt + 1 #ncnvtop
-            n_conv_bot= nstr[nz+2] +1 #ncnvbot
+            i_count= 1 #icount
 
-            if nz == 0 :
-                n_top -= 1
-            
-            
-            
-        # begin jacobian calculation here
-        # +1 to include last element
-            for jm in range(n_top, n_strt+1):
+            flag_no = 0
+            if no < 0 :
+                no_temporary = no
+                no = 0 # to avoid negative of negative index leading to wrong indexing, fort vs. py
+                flag_no = 1 # so that it can be reversed back to previous value after loop
 
-                # chose perturbation for each level
+            for nz in range(0, 3*nofczns, 3):
 
-                i_count += 1
+                n_top = nstr[nz] +1 #ntop
+                n_strt = nstr[nz+1] #nstrt
+                n_conv_top = n_strt + 1 #ncnvtop
+                n_conv_bot= nstr[nz+2] +1 #ncnvbot
 
-                #eps is just a tolerance value currently fixed at 1e-4
-                del_t = max(eps * temp_old[jm], 3.0) # perturbation
+                if nz == 0 :
+                    n_top -= 1
 
-                beta[jm] += del_t # perturb
 
-                
-                # now reconstruct Temp profile
 
-                for nb in range(0, 3*nofczns, 3):
+            # begin jacobian calculation here
+            # +1 to include last element
+                for jm in range(n_top, n_strt+1):
 
-                    n_top_b = nstr[nb] + 1 # ntopb
-                    
-                    if nb == 0:
-                        n_top_b -= 1 #ntopb
-                    
-                    n_strt_b = nstr[nb+1] # nstrtb
-                    
-                    n_conv_top_b = n_strt_b + 1 #nctopb
+                    # chose perturbation for each level
 
-                    n_bot_b = nstr[nb+2] +1 #nbotb
+                    i_count += 1
 
-                    
-                    # +1 to include last element   
-                    for j1 in range(n_top_b,n_strt_b+1):
-                        temp[j1] = beta[j1]
-                    
-                    # +1 to include last element
-                    for j1 in range(n_conv_top_b, n_bot_b+1): 
-                        
-                        press = sqrt(pressure[j1-1]*pressure[j1])
+                    #eps is just a tolerance value currently fixed at 1e-4
+                    del_t = max(eps * temp_old[jm], 3.0) # perturbation
 
-                        #update temp before throwing to moist_grad function
-                        Atmosphere=replace_temp(Atmosphere,temp)
-                        if moist == True:
-                            grad_x, cp_x = moist_grad( beta[j1-1], press, AdiabatBundle, Atmosphere, j1-1)
-                        else: 
-                            grad_x, cp_x = did_grad_cp( beta[j1-1], press, AdiabatBundle)
-                        
-                        temp[j1]= exp(log(temp[j1-1]) + grad_x*(log(pressure[j1]) - log(pressure[j1-1])))
-                
-                
+                    beta[jm] += del_t # perturb
 
-                # temperature has been perturbed
-                # now recalculate the IR fluxes, so call picaso with only thermal
 
-                #flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(pressure, temp, dwni, bb , y2, tp, tmin, tmax, DTAU, TAU, W0, 
-                        #COSB,ftau_cld, ftau_ray,GCOS2, DTAU_OG, TAU_OG, W0_OG, COSB_OG, W0_no_raman , surf_reflect, 
-                        #ubar0,ubar1,cos_theta, F0PI, single_phase,multi_phase,frac_a,frac_b,frac_c,constant_back,constant_forward, 
-                        #wno,nwno,ng,nt,gweight,tweight, nlevel, ngauss, gauss_wts, False, True) #false for reflected, True for thermal
-                
-                #if do_holes == True:
-                #    flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(pressure, temp, dwni, bb , y2, tp, tmin, tmax, DTAU, TAU, W0, 
-                #        COSB,ftau_cld, ftau_ray,GCOS2, DTAU_OG, TAU_OG, W0_OG, COSB_OG, W0_no_raman , surf_reflect, 
-                #        ubar0,ubar1,cos_theta, F0PI, single_phase,multi_phase,frac_a,frac_b,frac_c,constant_back,constant_forward,
-                #        wno,nwno,ng,nt,gweight,tweight, nlevel, ngauss, gauss_wts, False, True, fhole, DTAU_clear , TAU_clear , W0_clear , COSB_clear , 
-                #        DTAU_OG_clear , TAU_OG_clear , W0_OG_clear, COSB_OG_clear , W0_no_raman_clear, do_holes=True) #false for reflected, True for thermal
-                
-                Atmosphere=replace_temp(Atmosphere,temp)
-                if do_holes == True:
-                    flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
-                                Disco,Opagrid, F0PI, compute_reflected, compute_thermal, 
-                                do_holes=do_holes,fhole=fhole, hole_OpacityWEd=hole_OpacityWEd,hole_OpacityNoEd=hole_OpacityNoEd)
+                    # now reconstruct Temp profile
 
-                else:                
-                    flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
-                                Disco,Opagrid, F0PI, compute_reflected, compute_thermal)
-             
+                    for nb in range(0, 3*nofczns, 3):
 
-                # extract ir fluxes
+                        n_top_b = nstr[nb] + 1 # ntopb
 
-                flux_net_ir_layer = flux_net_ir_layer_full[:] #fmneti
-                flux_net_ir = flux_net_ir_full[:]     #fneti
-                flux_plus_ir = flux_plus_ir_full[:,:]  
-                flux_minus_ir = flux_minus_ir_full[:,:]
+                        if nb == 0:
+                            n_top_b -= 1 #ntopb
 
-     
-                
-                # now calculate jacobian terms in the same way as dflux
-                nco = n_top_r
-                
-                # -ve nco and no will mess indexing
-                # so we want to set them to 0 temporarily if that occurs
-                flag_nco = 0 
-                if nco < 0 :
-                    nco_temporary = nco
-                    nco = 0 # to avoid negative of negative index leading to wrong indexing, fort vs. py
-                    flag_nco = 1 # so that it can be reversed back to previous value after loop
+                        n_strt_b = nstr[nb+1] # nstrtb
 
-                for nc in range(0,3*nofczns, 3):
-                    
-                    n_top_c = nstr[nc] +1 # ntopc
+                        n_conv_top_b = n_strt_b + 1 #nctopb
 
-                    if nc ==0:
-                        n_top_c -= 1
-                    n_strt_c = nstr[nc+1]
-                    n_bot_c = nstr[nc+2] +1
-                    
-                    
-                        
-                    
-                   
-                    if n_top_c == n_top_r+1 :
-                        
-                        A[n_top_c-nco,jm-no] = (flux_net_ir[n_top_c]-flux_net_old[n_top_c])/del_t
-                        
+                        n_bot_b = nstr[nb+2] +1 #nbotb
+
+
+                        # +1 to include last element
+                        for j1 in range(n_top_b,n_strt_b+1):
+                            temp[j1] = beta[j1]
+
+                        # +1 to include last element
+                        for j1 in range(n_conv_top_b, n_bot_b+1):
+
+                            press = sqrt(pressure[j1-1]*pressure[j1])
+
+                            #update temp before throwing to moist_grad function
+                            Atmosphere=replace_temp(Atmosphere,temp)
+                            if moist == True:
+                                grad_x, cp_x = moist_grad( beta[j1-1], press, AdiabatBundle, Atmosphere, j1-1)
+                            else:
+                                grad_x, cp_x = did_grad_cp( beta[j1-1], press, AdiabatBundle)
+
+                            temp[j1]= exp(log(temp[j1-1]) + grad_x*(log(pressure[j1]) - log(pressure[j1-1])))
+
+
+
+                    # temperature has been perturbed
+                    # now recalculate the IR fluxes, so call picaso with only thermal
+
+                    #flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(pressure, temp, dwni, bb , y2, tp, tmin, tmax, DTAU, TAU, W0,
+                            #COSB,ftau_cld, ftau_ray,GCOS2, DTAU_OG, TAU_OG, W0_OG, COSB_OG, W0_no_raman , surf_reflect,
+                            #ubar0,ubar1,cos_theta, F0PI, single_phase,multi_phase,frac_a,frac_b,frac_c,constant_back,constant_forward,
+                            #wno,nwno,ng,nt,gweight,tweight, nlevel, ngauss, gauss_wts, False, True) #false for reflected, True for thermal
+
+                    #if do_holes == True:
+                    #    flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(pressure, temp, dwni, bb , y2, tp, tmin, tmax, DTAU, TAU, W0,
+                    #        COSB,ftau_cld, ftau_ray,GCOS2, DTAU_OG, TAU_OG, W0_OG, COSB_OG, W0_no_raman , surf_reflect,
+                    #        ubar0,ubar1,cos_theta, F0PI, single_phase,multi_phase,frac_a,frac_b,frac_c,constant_back,constant_forward,
+                    #        wno,nwno,ng,nt,gweight,tweight, nlevel, ngauss, gauss_wts, False, True, fhole, DTAU_clear , TAU_clear , W0_clear , COSB_clear ,
+                    #        DTAU_OG_clear , TAU_OG_clear , W0_OG_clear, COSB_OG_clear , W0_no_raman_clear, do_holes=True) #false for reflected, True for thermal
+
+                    Atmosphere=replace_temp(Atmosphere,temp)
+                    if do_holes == True:
+                        solver_stats[1] += 1
+                        flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
+                                    Disco,Opagrid, F0PI, compute_reflected, compute_thermal,
+                                    do_holes=do_holes,fhole=fhole, hole_OpacityWEd=hole_OpacityWEd,hole_OpacityNoEd=hole_OpacityNoEd)
+
                     else:
-                        
-                        A[n_top_c-nco,jm-no] = (flux_net_ir_layer[n_top_c-1]-flux_net_midpt_old[n_top_c-1])/del_t
-                        
-                    
-                    
-                    # omitted -1 to include last element 
-                    
-                    for im in range(n_top_c,n_strt_c):
-                        #print(im+1-nco,jm-no, "3rd",jm,no)
-                        A[im+1-nco,jm-no] = (flux_net_ir_layer[im]-flux_net_midpt_old[im])/del_t
-                        
-                    # changing them back to what they were
-                    
-                    if flag_nco == 1 :
-                        nco= nco_temporary
-                        flag_nco = 0
-                    
-                    
-                       
+                        solver_stats[1] += 1
+                        flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
+                                    Disco,Opagrid, F0PI, compute_reflected, compute_thermal)
 
-                    nco+= n_bot_c-n_strt_c
-                
 
-                # undo beta vector perturbation
-                beta[jm] = beta[jm] - del_t
-            
-            if flag_no == 1 :
-                no= no_temporary
-                flag_no = 0
-            
-            no += n_conv_bot-n_strt
-        
+                    # extract ir fluxes
+
+                    flux_net_ir_layer = flux_net_ir_layer_full[:] #fmneti
+                    flux_net_ir = flux_net_ir_full[:]     #fneti
+                    flux_plus_ir = flux_plus_ir_full[:,:]
+                    flux_minus_ir = flux_minus_ir_full[:,:]
+
+
+
+                    # now calculate jacobian terms in the same way as dflux
+                    nco = n_top_r
+
+                    # -ve nco and no will mess indexing
+                    # so we want to set them to 0 temporarily if that occurs
+                    flag_nco = 0
+                    if nco < 0 :
+                        nco_temporary = nco
+                        nco = 0 # to avoid negative of negative index leading to wrong indexing, fort vs. py
+                        flag_nco = 1 # so that it can be reversed back to previous value after loop
+
+                    for nc in range(0,3*nofczns, 3):
+
+                        n_top_c = nstr[nc] +1 # ntopc
+
+                        if nc ==0:
+                            n_top_c -= 1
+                        n_strt_c = nstr[nc+1]
+                        n_bot_c = nstr[nc+2] +1
+
+
+
+
+
+                        if n_top_c == n_top_r+1 :
+
+                            A[n_top_c-nco,jm-no] = (flux_net_ir[n_top_c]-flux_net_old[n_top_c])/del_t
+
+                        else:
+
+                            A[n_top_c-nco,jm-no] = (flux_net_ir_layer[n_top_c-1]-flux_net_midpt_old[n_top_c-1])/del_t
+
+
+
+                        # omitted -1 to include last element
+
+                        for im in range(n_top_c,n_strt_c):
+                            #print(im+1-nco,jm-no, "3rd",jm,no)
+                            A[im+1-nco,jm-no] = (flux_net_ir_layer[im]-flux_net_midpt_old[im])/del_t
+
+                        # changing them back to what they were
+
+                        if flag_nco == 1 :
+                            nco= nco_temporary
+                            flag_nco = 0
+
+
+
+
+                        nco+= n_bot_c-n_strt_c
+
+
+                    # undo beta vector perturbation
+                    beta[jm] = beta[jm] - del_t
+
+                if flag_no == 1 :
+                    no= no_temporary
+                    flag_no = 0
+
+                no += n_conv_bot-n_strt
+
+            jacobian_cache = A.copy()
+            jacobian_age = 0
+            force_jacobian = False
+            if outer_jacobian is not None and outer_meta is not None:
+                outer_jacobian[:] = jacobian_cache
+                outer_meta[0] = 1.
+                outer_meta[1] = 0.
+                outer_meta[2:] = jacobian_temp
+        else:
+            solver_stats[3] += 1
+            # mat_sol factors A in place; never reuse its LU workspace.
+            A = jacobian_cache.copy()
+
         # a long print statement here in original. dont know if needed
 
         
@@ -1262,6 +1333,7 @@ def t_start(nofczns,nstr,convergence_criteria,#
             p[i] = -f_vec[i]
         
         f_old = f #fold
+        residual_old = f_vec.copy()
         
         #print('f_vec[0],f_vec[-1],min,max:f_vec', 
         #    f_vec[0],f_vec[-1],min(f_vec),max(f_vec))
@@ -1405,11 +1477,13 @@ def t_start(nofczns,nstr,convergence_criteria,#
             #    DTAU_OG_clear , TAU_OG_clear, W0_OG_clear, COSB_OG_clear , W0_no_raman_clear, do_holes=True) #false reflected, True thermal
             Atmosphere=replace_temp(Atmosphere,temp)
             if do_holes == True:
+                solver_stats[1] += 1
                 flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
                             Disco,Opagrid, F0PI, reflected = False, thermal=compute_thermal, 
                             do_holes=do_holes,fhole=fhole, hole_OpacityWEd=hole_OpacityWEd,hole_OpacityNoEd=hole_OpacityNoEd)
 
             else:                
+                solver_stats[1] += 1
                 flux_net_v_layer_full, flux_net_v_full, flux_plus_v_full, flux_minus_v_full , flux_net_ir_layer_full, flux_net_ir_full, flux_plus_ir_full, flux_minus_ir_full = get_fluxes(Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase,
                             Disco,Opagrid, F0PI,reflected = False, thermal=compute_thermal)
          
@@ -1468,6 +1542,12 @@ def t_start(nofczns,nstr,convergence_criteria,#
             # if verbose: print('cond1:alam.lt.alamin',alam, alamin)
             # if verbose: print('cond2:f.le.CCC',f,f_old + alf*alam*slope)
             # if verbose: print('f,fold,alf,alam,slope',f,f_old,alf,alam,slope)
+            # A rejected stale-J trial is cheaper to recover from by refreshing
+            # once than by an extended line search using the wrong derivative.
+            if reused_jacobian and (not np.isfinite(f) or
+                                     f > f_old + alf*alam*slope):
+                retry_jacobian = True
+                break
             #First check: Is T too small to continue? 
             if alam < alamin :
                 check = True
@@ -1515,6 +1595,8 @@ def t_start(nofczns,nstr,convergence_criteria,#
                         
                         tmplam= 0.5*alam
             if ((flag_converge != 2) & (flag_converge != 1)):
+                solver_stats[4] += 1
+                force_jacobian = True
                 alam2=alam
                 f2=f
                 
@@ -1527,12 +1609,73 @@ def t_start(nofczns,nstr,convergence_criteria,#
                 if verbose: print("Got stuck with temp NaN -- so escaping the while loop in tstart")
         
 
+        if retry_jacobian:
+            solver_stats[5] += 1
+            temp = temp_old.copy()
+            Atmosphere = replace_temp(Atmosphere, temp)
+            flux_net_ir = flux_net_old.copy()
+            flux_net_ir_layer = flux_net_midpt_old.copy()
+            flux_plus_ir = flux_plus_ir_old.copy()
+            force_jacobian = True
+            if outer_meta is not None:
+                outer_meta[0] = 0.
+            continue
+        jacobian_age += 1
+        if outer_meta is not None:
+            outer_meta[1] = jacobian_age
+            if force_jacobian:
+                outer_meta[0] = 0.
+        if (jacobian_broyden or jacobian_residual_refresh) and jacobian_max_age > 1 and not force_jacobian:
+            # Good Broyden update from the *actual* independent-temperature
+            # step, accounting for any temperature clipping/reconstruction.
+            step = np.zeros(n_total)
+            column = 0
+            for nz in range(0, 3*nofczns, 3):
+                first = nstr[nz] + 1
+                if nz == 0:
+                    first -= 1
+                for level in range(first, nstr[nz+1]+1):
+                    step[column] = temp[level] - temp_old[level]
+                    column += 1
+            denominator = np.dot(step, step)
+            if denominator > 1e-20 and np.all(np.isfinite(f_vec[:n_total])):
+                correction = f_vec[:n_total] - residual_old[:n_total] - np.dot(jacobian_cache[:n_total, :n_total], step)
+                if jacobian_residual_refresh:
+                    old_norm = np.linalg.norm(residual_old[:n_total])
+                    new_norm = np.linalg.norm(f_vec[:n_total])
+                    prediction_error = np.linalg.norm(correction) / max(old_norm, 1e-30)
+                    if prediction_error > .5 or new_norm > .99*old_norm:
+                        force_jacobian = True
+                if jacobian_broyden and not force_jacobian:
+                    jacobian_cache[:n_total, :n_total] += np.outer(correction, step) / denominator
+                    solver_stats[6] += 1
+        # A small cached-J step is not evidence of a root. If its actual flux
+        # residual is already small, no extra derivative evaluation is needed;
+        # otherwise refresh before allowing the legacy small-step exit.
+        if reused_jacobian and flag_converge == 2:
+            scaled_residual = np.max(np.abs(f_vec[:n_total])) / max(abs(tidal[0]), 1e-30)
+            if scaled_residual >= tolf:
+                flag_converge = 1
+                force_jacobian = True
+
+        if inner_flux_tolerance > 0:
+            scaled_residual = np.max(np.abs(f_vec[:n_total])) / max(abs(tidal[0]), 1e-30)
+            if np.isfinite(scaled_residual) and scaled_residual < inner_flux_tolerance:
+                flag_converge = 2
+            else:
+                # Do not confuse a small or stalled temperature step with the
+                # requested inexact residual target.
+                flag_converge = 1
+
+        if outer_meta is not None and force_jacobian:
+            outer_meta[0] = 0.
         if verbose: print("Iteration number ", its,", min , max temp ", min(temp),max(temp), ", flux balance ", flux_net[0]/abs(tidal[0])) #f/abs(tidal[0])**2) this other output here is slightly less straightforward with the square terms for exoplanets so making this just fnet/tidal for now
 
         if save_profile == 1:
             all_profiles = np.append(all_profiles,temp_old)
             cldsave_count += 1
         if flag_converge == 2 : # converged
+            inner_converged[0] = True
             # calculate  lapse rate
             dtdp=np.zeros(shape=(nlevel-1))
             for j in range(nlevel -1):
@@ -2880,6 +3023,16 @@ def update_clouds(bundle, CloudParameters, Atmosphere, kzz,virga_kwargs, nimbus_
     ```
     """
     opd_cld_climate, g0_cld_climate, w0_cld_climate = CloudParameters.OPD.copy(), CloudParameters.G0.copy(), CloudParameters.W0.copy()
+    controls = bundle.inputs['climate']
+    adaptive = controls.get('cloud_relaxation', 'legacy') in ('adaptive', 'aitken')
+    coupling_enabled = adaptive or controls.get('cloud_inexact', False)
+    if adaptive:
+        state = controls.setdefault('_cloud_solver_state', {})
+        previous_moments = state.get('used')
+        if previous_moments is None or previous_moments.shape[1:] != opd_cld_climate.shape[:2]:
+            previous_moments = np.mean(optical_moments(opd_cld_climate, w0_cld_climate, g0_cld_climate), axis=-1)
+            state.pop('residual', None)
+            state.pop('alpha', None)
     we0, we1, we2, we3 = 0.25, 0.25, 0.25, 0.25
 
     opd_prev_cld_step = (we0 * opd_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3])
@@ -2907,11 +3060,28 @@ def update_clouds(bundle, CloudParameters, Atmosphere, kzz,virga_kwargs, nimbus_
 
     sum_opd_clmt = (we0 * opd_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3])
     opd_clmt = (we0 * opd_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3])
-    g0_clmt = (we0 * opd_cld_climate[:, :, 0] * g0_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] * g0_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] * g0_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3] * g0_cld_climate[:, :, 3]) / (sum_opd_clmt)
-    w0_clmt = (we0 * opd_cld_climate[:, :, 0] * w0_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] * w0_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] * w0_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3] * w0_cld_climate[:, :, 3]) / (sum_opd_clmt)
+    # Cloud-free cells have undefined scattering averages; use zero without 0/0.
+    g0_clmt = np.divide(
+        (we0 * opd_cld_climate[:, :, 0] * g0_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] * g0_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] * g0_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3] * g0_cld_climate[:, :, 3]),
+        sum_opd_clmt, out=np.zeros_like(sum_opd_clmt), where=sum_opd_clmt != 0.0)
+    w0_clmt = np.divide(
+        (we0 * opd_cld_climate[:, :, 0] * w0_cld_climate[:, :, 0] + we1 * opd_cld_climate[:, :, 1] * w0_cld_climate[:, :, 1] + we2 * opd_cld_climate[:, :, 2] * w0_cld_climate[:, :, 2] + we3 * opd_cld_climate[:, :, 3] * w0_cld_climate[:, :, 3]),
+        sum_opd_clmt, out=np.zeros_like(sum_opd_clmt), where=sum_opd_clmt != 0.0)
     g0_clmt = np.nan_to_num(g0_clmt, nan=0.0)
     w0_clmt = np.nan_to_num(w0_clmt, nan=0.0)
     opd_clmt[np.where(opd_clmt <= 1e-5)] = 0.0
+
+    if adaptive:
+        raw_moments = optical_moments(opd_now, w0_now, g0_now)
+        used_moments, diagnostics = adaptive_cloud_step(raw_moments, previous_moments, state,
+            method=controls.get('cloud_relaxation', 'adaptive'))
+        state['used'] = used_moments.copy()
+        opd_clmt, w0_clmt, g0_clmt = optical_properties(used_moments)
+        controls['cloud_diagnostics'] = diagnostics
+    elif coupling_enabled:
+        controls['cloud_diagnostics'] = dict(defect=scaled_cloud_defect(
+            optical_moments(opd_now, w0_now, g0_now),
+            optical_moments(opd_clmt, w0_clmt, g0_clmt)))
 
     df_cld = vj.picaso_format(opd_clmt, w0_clmt, g0_clmt, pressure=cld_out['pressure'], wavenumber=1e4 / cld_out['wave'])
     #bundle.clouds(df=df_cld)
@@ -2919,6 +3089,11 @@ def update_clouds(bundle, CloudParameters, Atmosphere, kzz,virga_kwargs, nimbus_
     diff = (opd_clmt - opd_prev_cld_step)
     taudif = np.max(np.abs(diff))
     taudif_tol = 0.4 * np.max(0.5 * (opd_clmt + opd_prev_cld_step))
+    if coupling_enabled:
+        # The surrounding profile loop tests taudif < taudif_tol. Use the
+        # unmixed cloud closure defect; damped/averaged steps can hide cycles.
+        taudif = controls['cloud_diagnostics']['defect']
+        taudif_tol = 1.0
 
     if save_profile == 1:
         all_opd = np.append(all_opd, df_cld['opd'].values[55::196])
@@ -3008,6 +3183,15 @@ def profile(bundle, nofczns, nstr, temp, pressure,
     convt = convergence_criteria.convt
     itmx = convergence_criteria.itmx
     cloudy =  CloudParameters.cloudy
+    cloud_work_cap = (bundle.inputs['climate'].get('cloud_inner_maxiter')
+                      if cloudy and bundle.inputs['climate'].get('cloud_inexact', False) else None)
+    remaining_inner_budget = itmx*convergence_criteria.it_max
+    if cloud_work_cap is not None:
+        # Reallocate the existing thermal-iteration budget into more frequent
+        # cloud refreshes, rather than silently giving the method extra work.
+        # At least one iteration is charged for each inner call. Early exits
+        # can therefore leave budget for additional inexpensive cloud updates.
+        itmx = max(itmx, remaining_inner_budget)
 
    #under what circumstances to do we compute a self consistent kzz calc 
     sc_kzz_and_clouds = cloudy #THIS IS ALWAYS BE TRUE.. 
@@ -3019,6 +3203,15 @@ def profile(bundle, nofczns, nstr, temp, pressure,
         
 
     if cloudy: 
+        if bundle.inputs['climate'].get('cloud_relaxation', 'legacy') in ('adaptive', 'aitken'):
+            state = bundle.inputs['climate'].setdefault('_cloud_solver_state', {})
+            topology = tuple(np.asarray(nstr, dtype=int))
+            if state.get('topology') != topology:
+                # Preserve the cloud field, but not a secant/damping history
+                # for a different radiative/convective temperature mapping.
+                state.pop('residual', None)
+                state.pop('alpha', None)
+                state['topology'] = topology
         virga_kwargs = {key.replace('virga_',''):getattr(CloudParameters,key) for key in CloudParameters._fields if 'virga' in key}
         hole_kwargs = {key.replace('patchy_',''):getattr(CloudParameters,key) for key in CloudParameters._fields if 'patchy' in key}
         nimbus_kwargs = {key.replace('nimbus_',''):getattr(CloudParameters,key) for key in CloudParameters._fields if 'nimbus' in key}
@@ -3138,29 +3331,118 @@ def profile(bundle, nofczns, nstr, temp, pressure,
     #            save_profile, all_profiles, 
     #            verbose, moist , egp_stepmax ],file)
 
+    controls = bundle.inputs['climate']
+    outer_cache = np.zeros((len(temp), len(temp)))
+    if (do_holes or moist) and any(controls.get(k, False) for k in
+            ('cloud_outer_reuse', 'cloud_radiation_cadence', 'cloud_joint')):
+        raise ValueError('Experimental outer controls currently require fully cloudy dry-adiabat models')
+    outer_meta = np.zeros(len(temp)+2)
+    reference_optics = None
+    radiation_reference = None
+    radiation_temp = temp.copy()
+    radiation_age = 0
+    radiation_solved = False
+    joint_state = {}
+    outer_stats = controls.setdefault('outer_solver_stats', dict(cache_invalidations=0, radiation_skips=0, joint_steps=0))
+
     ## begin bigger loop which gets opacities
     for iii in range(itmx):
 
-        if do_holes == True:
-            temp, dtdp, all_profiles,  flux_net_ir_layer,flux_net_v_layer, flux_plus_ir_attop = t_start(
-                nofczns,nstr,convergence_criteria, rfaci, rfacv, tidal,
-                Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase, Disco,Opagrid, AdiabatBundle,
-                F0PI,
-                save_profile, all_profiles, 
-                verbose=verbose, moist = moist, egp_stepmax = egp_stepmax, 
-                do_holes=do_holes, fhole=fhole, hole_OpacityWEd=OpacityWEd_clear,hole_OpacityNoEd=OpacityNoEd_clear)
+        if cloud_work_cap is not None and remaining_inner_budget <= 0:
+            break
+
+        thermal_before = temp.copy()
+        cloud_before = None
+        if cloudy and controls.get('cloud_joint', False):
+            cloud_before = optical_moments(df_cld['opd'].to_numpy(), df_cld['w0'].to_numpy(), df_cld['g0'].to_numpy())
+        current_optics = np.stack((OpacityNoEd.DTAU, OpacityNoEd.DTAU*OpacityNoEd.W0,
+                                  OpacityNoEd.DTAU*OpacityNoEd.W0*OpacityNoEd.COSB)) if cloudy and (controls.get('cloud_outer_reuse') or controls.get('cloud_radiation_cadence')) else None
+        cache = None
+        meta = None
+        if cloudy and controls.get('cloud_outer_reuse', False) and not do_holes:
+            cache, meta = outer_cache, outer_meta
+            if (reference_optics is None or not np.all(np.isfinite(current_optics)) or
+                    (not controls.get('jacobian_residual_refresh', False) and
+                     optical_change(current_optics, reference_optics) > .05)):
+                meta[0] = 0.
+                outer_stats['cache_invalidations'] += 1
+                reference_optics = current_optics.copy()
+        skip_radiation = (cloudy and controls.get('cloud_radiation_cadence', False) and
+            radiation_can_skip(radiation_solved, radiation_age, temp, radiation_temp,
+                               current_optics, radiation_reference))
+        inner_flux_tolerance = 0.0
+        inner_criteria = convergence_criteria
+        if cloudy and bundle.inputs['climate'].get('cloud_inexact', False):
+            diagnostics = bundle.inputs['climate'].get('cloud_diagnostics', {})
+            defect = diagnostics.get('defect', np.inf)
+            inner_flux_tolerance = cloud_inner_tolerance(defect)
+            inner_criteria = convergence_criteria._replace(it_max=cloud_iteration_limit(
+                convergence_criteria.it_max, defect,
+                bundle.inputs['climate'].get('cloud_inner_maxiter')))
+            diagnostics['inner_flux_tolerance'] = inner_flux_tolerance
+        if cloud_work_cap is not None:
+            inner_criteria = inner_criteria._replace(it_max=int(np.minimum(inner_criteria.it_max, remaining_inner_budget)))
+        inner_converged = np.zeros(1, dtype=np.bool_)
+        iteration_stats = bundle.inputs['climate'].get('solver_stats')
+        iterations_before = int(iteration_stats[0]) if iteration_stats is not None else 0
+        builds_before = int(iteration_stats[2]) if iteration_stats is not None else 0
+
+        if skip_radiation:
+            radiation_age += 1
+            outer_stats['radiation_skips'] += 1
+            inner_converged[0] = False
         else:
-            temp, dtdp, all_profiles,  flux_net_ir_layer,flux_net_v_layer, flux_plus_ir_attop = t_start(
-                    nofczns,nstr,convergence_criteria, rfaci, rfacv, tidal,
+            if do_holes == True:
+                temp, dtdp, all_profiles,  flux_net_ir_layer,flux_net_v_layer, flux_plus_ir_attop = t_start(
+                    nofczns,nstr,inner_criteria, rfaci, rfacv, tidal,
                     Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase, Disco,Opagrid, AdiabatBundle,
                     F0PI,
                     save_profile, all_profiles, 
-                    verbose=verbose, moist = moist, egp_stepmax = egp_stepmax)
+                    verbose=verbose, moist = moist, egp_stepmax = egp_stepmax,
+                    jacobian_max_age=bundle.inputs['climate'].get('jacobian_max_age', 1),
+                    jacobian_max_drift=bundle.inputs['climate'].get('jacobian_max_drift', 0.02),
+                    solver_stats=bundle.inputs['climate'].get('solver_stats'),
+                    jacobian_broyden=bundle.inputs['climate'].get('jacobian_broyden', False),
+                    inner_flux_tolerance=inner_flux_tolerance,
+                    inner_converged=inner_converged, outer_jacobian=cache, outer_meta=meta,
+                    jacobian_residual_refresh=controls.get('jacobian_residual_refresh', False),
+                    do_holes=do_holes, fhole=fhole, hole_OpacityWEd=OpacityWEd_clear,hole_OpacityNoEd=OpacityNoEd_clear)
+            else:
+                temp, dtdp, all_profiles,  flux_net_ir_layer,flux_net_v_layer, flux_plus_ir_attop = t_start(
+                        nofczns,nstr,inner_criteria, rfaci, rfacv, tidal,
+                        Atmosphere, OpacityWEd, OpacityNoEd,ScatteringPhase, Disco,Opagrid, AdiabatBundle,
+                        F0PI,
+                        save_profile, all_profiles,
+                        verbose=verbose, moist = moist, egp_stepmax = egp_stepmax,
+                        jacobian_max_age=bundle.inputs['climate'].get('jacobian_max_age', 1),
+                        jacobian_max_drift=bundle.inputs['climate'].get('jacobian_max_drift', 0.02),
+                        solver_stats=bundle.inputs['climate'].get('solver_stats'),
+                        jacobian_broyden=bundle.inputs['climate'].get('jacobian_broyden', False),
+                        inner_flux_tolerance=inner_flux_tolerance, inner_converged=inner_converged, outer_jacobian=cache, outer_meta=meta,
+                        jacobian_residual_refresh=controls.get('jacobian_residual_refresh', False))
+            radiation_solved = bool(inner_converged[0])
+            if cache is not None and iteration_stats is not None and int(iteration_stats[2]) > builds_before:
+                reference_optics = current_optics.copy()
+            radiation_age = 0
+            radiation_temp = temp.copy()
+            if current_optics is not None:
+                radiation_reference = current_optics.copy()
+
+        if cloud_work_cap is not None:
+            used_iterations = (max(1, int(iteration_stats[0])-iterations_before)
+                               if iteration_stats is not None else inner_criteria.it_max)
+            remaining_inner_budget -= used_iterations
         
         ### 1) ALWAYS UPDATE PT, CHEM, OPACITIES
         bundle.add_pt( temp, pressure)
         #simple chem no quenching 
         bundle.premix_atmosphere(opa = opacityclass,quench_levels=None,verbose=verbose) 
+
+        if cloudy and bundle.inputs['climate'].get('cloud_refresh_thermodynamics', False):
+            # t_start returns T but its local Atmosphere replacement is not
+            # propagated here. Kzz needs current T, lapse rate, mmw and scale
+            # height; refreshing those does not require new gas opacity.
+            Atmosphere = calculate_atm(bundle, opacityclass, only_atmosphere=True)
         
         ### 2) IF: UPDATE KZZ 
         if do_kzz_calc:
@@ -3211,10 +3493,35 @@ def profile(bundle, nofczns, nstr, temp, pressure,
         
         ### 5) IF NEEDED: COMPUTE OPACITIES 
         refresh_needed = full_kinetis or do_quench_appox or cloudy
-        if refresh_needed:
+        if refresh_needed and cloud_before is None:
             OpacityWEd, OpacityNoEd, ScatteringPhase, Disco, Atmosphere,hole=calculate_atm(bundle, opacityclass )
             OpacityWEd_clear=hole[0]; OpacityNoEd_clear=hole[0]
         
+        if cloud_before is not None:
+            solved_temperature = temp.copy()
+            proposal = optical_moments(cld_out['opd_per_layer'].ravel(), cld_out['single_scattering'].ravel(), cld_out['asymmetry'].ravel())
+            temp, mixed, alpha = joint_relaxation(thermal_before, temp, cloud_before, proposal, joint_state,
+                scaled=controls.get('cloud_joint_scaled', False))
+            for zone in range(0, 3*nofczns, 3):
+                for level in range(nstr[zone+1]+1, nstr[zone+2]+2):
+                    gradient, _ = did_grad_cp(temp[level-1], np.sqrt(pressure[level-1]*pressure[level]), AdiabatBundle)
+                    temp[level] = temp[level-1]*(pressure[level]/pressure[level-1])**gradient
+            tau, omega, asymmetry = optical_properties(mixed)
+            df_cld['opd'], df_cld['w0'], df_cld['g0'] = tau, omega, asymmetry
+            bundle.clouds(df=df_cld, **hole_kwargs)
+            bundle.add_pt(temp, pressure)
+            bundle.premix_atmosphere(opa=opacityclass, quench_levels=None, verbose=verbose)
+            OpacityWEd, OpacityNoEd, ScatteringPhase, Disco, Atmosphere, hole = calculate_atm(bundle, opacityclass)
+            dtdp = np.diff(np.log(temp))/np.diff(np.log(pressure))
+            taudif = scaled_cloud_defect(proposal, mixed)
+            taudif_tol = 1.
+            inner_converged[0] = bool(inner_converged[0]) and np.max(abs(temp-solved_temperature)) < 1e-6
+            radiation_solved = False
+            outer_stats['joint_steps'] += 1
+            controls['cloud_diagnostics'] = dict(defect=taudif, alpha=alpha)
+            if '_cloud_solver_state' in controls:
+                controls['_cloud_solver_state']['used'] = mixed.reshape((3,)+cld_out['opd_per_layer'].shape)
+
         # 6) PREP RETURNS! 
         # TO DO : add chemistry and also condense last three "all" variables into one tuple
         RETURNS = [conv_flag, pressure, temp , dtdp, 
@@ -3232,7 +3539,10 @@ def profile(bundle, nofczns, nstr, temp, pressure,
         
         ert = ert/(float(len(temp))*scalt)
         
-        if ((iii > 0) & (ert < convt) & (taudif < taudif_tol)) :
+        inner_ok = (not skip_radiation and
+                    (inner_flux_tolerance == 0.0 or bool(inner_converged[0])) and
+                    (cloud_before is None or bool(inner_converged[0])))
+        if ((iii > 0) & (ert < convt) & (taudif < taudif_tol) & inner_ok) :
             if verbose: print("Profile converged before itmx")
             conv_flag = 1
             #update convergence flag!! 
